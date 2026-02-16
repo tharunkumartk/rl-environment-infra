@@ -133,6 +133,37 @@ class RolloutLogger:
         self.steps.append(step_data)
         self._write_log()
 
+    def log_error(
+        self,
+        error_message: str,
+        error_type: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+        context: Optional[dict[str, Any]] = None,
+    ):
+        """
+        Log detailed error information.
+        
+        Args:
+            error_message: The error message
+            error_type: Type of error (e.g., "Exception", "ValueError")
+            stack_trace: Full stack trace as string
+            context: Additional context (e.g., current step, function being called)
+        """
+        self.step_counter += 1
+        
+        step_data = {
+            "step_number": self.step_counter,
+            "timestamp": datetime.utcnow().isoformat(),
+            "error": True,
+            "error_message": error_message,
+            "error_type": error_type,
+            "stack_trace": stack_trace,
+            "context": context or {},
+        }
+        
+        self.steps.append(step_data)
+        self._write_log()
+
     def complete(self, error: Optional[str] = None):
         """Mark the completion of the rollout."""
         self.completed_at = datetime.utcnow().isoformat()
@@ -169,9 +200,24 @@ def suppress_stdout_stderr():
     Context manager to suppress all stdout and stderr output.
     Useful for silencing noisy agent/library output.
     """
+    import logging
+    
     # Save original stdout/stderr
     original_stdout = sys.stdout
     original_stderr = sys.stderr
+    
+    # Save original logging level and disable all logging
+    original_log_level = logging.root.level
+    logging.root.setLevel(logging.CRITICAL + 1)  # Disable all logging
+    
+    # Disable Google SDK loggers specifically
+    google_loggers = [
+        logging.getLogger('google'),
+        logging.getLogger('google.genai'),
+    ]
+    original_google_levels = [logger.level for logger in google_loggers]
+    for logger in google_loggers:
+        logger.setLevel(logging.CRITICAL + 1)
 
     # Redirect to devnull
     devnull = open(os.devnull, "w")
@@ -181,7 +227,20 @@ def suppress_stdout_stderr():
     try:
         yield
     finally:
-        # Restore original stdout/stderr
+        # Restore original stdout/stderr BEFORE closing devnull
+        # This prevents "I/O operation on closed file" errors
+        # if any code tries to write during cleanup
         sys.stdout = original_stdout
         sys.stderr = original_stderr
-        devnull.close()
+        
+        # Restore logging levels
+        logging.root.setLevel(original_log_level)
+        for logger, level in zip(google_loggers, original_google_levels):
+            logger.setLevel(level)
+        
+        # Close devnull after restoring everything
+        try:
+            devnull.flush()
+            devnull.close()
+        except Exception:
+            pass  # Ignore errors during cleanup

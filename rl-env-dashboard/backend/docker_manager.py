@@ -1,10 +1,9 @@
 import subprocess
-import sys
 import time
 import os
 import requests
-from typing import Tuple, Set
-from pathlib import Path
+import secrets
+from typing import Tuple, Set, Dict
 
 # Port allocation tracking
 _used_ports: Set[int] = set()
@@ -15,9 +14,21 @@ SQL_DUMP_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "metabase_envdata.sql"
 )
 
-# Shared Postgres container name
-SHARED_PG_CONTAINER = "metabase-shared-postgres"
-SHARED_PG_PORT = 5433  # Different from default to avoid conflicts
+# Path to agent-docker directory
+AGENT_DOCKER_PATH = os.path.join(os.path.dirname(__file__), "..", "agent-docker")
+
+# Docker image names
+AGENT_IMAGE_NAME = "rollout-agent:latest"
+METABASE_IMAGE_NAME = "metabase/metabase:latest"
+POSTGRES_IMAGE_NAME = "postgres:16"
+
+# Backend URL for agent communication (use host.docker.internal on Mac/Windows)
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://host.docker.internal:8000")
+
+# Database credentials
+DB_USER = "metabase"
+DB_PASSWORD = "metabase_password"
+DB_NAME = "metabasedb"
 
 
 def allocate_port() -> int:
@@ -36,556 +47,520 @@ def release_port(port: int):
     _used_ports.discard(port)
 
 
-def ensure_shared_postgres():
+def build_agent_image() -> bool:
     """
-    Ensure the shared Postgres container exists and has the data loaded.
-    This is called once at startup or when needed.
+    Build the custom Docker image containing Metabase, Postgres, and the agent.
+    Returns True if image exists or was built successfully.
     """
-    # Check if container already exists and is running
-    result = subprocess.run(
-        ["docker", "ps", "-q", "-f", f"name={SHARED_PG_CONTAINER}"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        # Check if image already exists
+        result = subprocess.run(
+            ["docker", "images", "-q", AGENT_IMAGE_NAME],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        
+        if result.stdout.strip():
+            print(f"Docker image {AGENT_IMAGE_NAME} already exists")
+            return True
+        
+        # Build the image from the project root (parent of rl-env-dashboard)
+        # This allows us to COPY both computer-use-preview/ and metabase_envdata.sql
+        project_root = os.path.join(os.path.dirname(__file__), "..", "..")
+        project_root = os.path.abspath(project_root)
+        
+        print(f"Building Docker image {AGENT_IMAGE_NAME}...")
+        print(f"Build context: {project_root}")
+        
+        # Create a build context that includes:
+        # - rl-env-dashboard/agent-docker/* (Dockerfile, scripts, etc.)
+        # - computer-use-preview/ (agent code)
+        # - metabase_envdata.sql (database dump)
+        
+        build_result = subprocess.run(
+            [
+                "docker",
+                "build",
+                "-t",
+                AGENT_IMAGE_NAME,
+                "-f",
+                "rl-env-dashboard/agent-docker/Dockerfile",
+                ".",  # Build context is project root
+            ],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        
+        if build_result.returncode != 0:
+            print(f"Error building Docker image:")
+            print(f"STDOUT: {build_result.stdout}")
+            print(f"STDERR: {build_result.stderr}")
+            return False
+        
+        print(f"Successfully built Docker image {AGENT_IMAGE_NAME}")
+        return True
+        
+    except Exception as e:
+        print(f"Error checking/building Docker image: {e}")
+        return False
 
-    if result.stdout.strip():
-        print(f"Shared Postgres container {SHARED_PG_CONTAINER} is already running")
-        return
 
-    # Check if container exists but is stopped
-    result = subprocess.run(
-        ["docker", "ps", "-aq", "-f", f"name={SHARED_PG_CONTAINER}"],
-        capture_output=True,
-        text=True,
-    )
+def generate_agent_token() -> str:
+    """Generate a secure random token for agent authentication."""
+    return secrets.token_urlsafe(32)
 
-    if result.stdout.strip():
-        print(f"Starting existing Postgres container {SHARED_PG_CONTAINER}...")
-        subprocess.run(["docker", "start", SHARED_PG_CONTAINER], check=True)
-        time.sleep(3)
-        return
 
-    # Create new shared Postgres container
-    print(f"Creating shared Postgres container {SHARED_PG_CONTAINER}...")
-
-    # Create Docker network if it doesn't exist
-    subprocess.run(
-        ["docker", "network", "create", "rollout-net"],
-        capture_output=True,
-        check=False,
-    )
-
-    # Start Postgres container (version 16 to match the dump format)
+def _start_postgres_container(
+    short_id: str, network_name: str, sql_dump_path: str
+) -> str:
+    """
+    Start PostgreSQL container with SQL dump loaded.
+    Returns container name.
+    """
+    container_name = f"rollout-postgres-{short_id}"
+    
+    # Ensure SQL dump exists
+    if not os.path.exists(sql_dump_path):
+        raise Exception(f"SQL dump not found at {sql_dump_path}")
+    
+    abs_dump_path = os.path.abspath(sql_dump_path)
+    
+    # Start PostgreSQL container
     subprocess.run(
         [
             "docker",
             "run",
             "-d",
             "--name",
-            SHARED_PG_CONTAINER,
+            container_name,
             "--network",
-            "rollout-net",
+            network_name,
             "-e",
-            "POSTGRES_USER=metabase",
+            f"POSTGRES_USER={DB_USER}",
             "-e",
-            "POSTGRES_PASSWORD=metabase_password",
+            f"POSTGRES_PASSWORD={DB_PASSWORD}",
             "-e",
-            "POSTGRES_DB=postgres",
-            "-p",
-            f"{SHARED_PG_PORT}:5432",
-            "postgres:16",
+            f"POSTGRES_DB={DB_NAME}",
+            "-v",
+            f"{abs_dump_path}:/docker-entrypoint-initdb.d/dump.sql:ro",
+            POSTGRES_IMAGE_NAME,
         ],
         check=True,
         capture_output=True,
     )
-
-    # Wait for Postgres to be ready
-    print(f"Waiting for Postgres to be ready...")
+    
+    # Wait for PostgreSQL to be ready
+    print(f"Waiting for PostgreSQL {container_name} to be ready...")
     max_retries = 30
     for i in range(max_retries):
-        result = subprocess.run(
-            ["docker", "exec", SHARED_PG_CONTAINER, "pg_isready", "-U", "metabase"],
-            capture_output=True,
-        )
-        if result.returncode == 0:
-            break
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container_name,
+                    "pg_isready",
+                    "-U",
+                    DB_USER,
+                ],
+                capture_output=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                print(f"PostgreSQL {container_name} is ready")
+                break
+        except Exception:
+            pass
+        
+        if i == max_retries - 1:
+            raise Exception(f"PostgreSQL {container_name} failed to start in time")
         time.sleep(1)
-    else:
-        raise Exception("Postgres failed to start in time")
-
-    # Load SQL dump into Postgres
-    print(f"Loading SQL data into Postgres...")
-    if not os.path.exists(SQL_DUMP_PATH):
-        raise Exception(f"SQL dump not found at {SQL_DUMP_PATH}")
-
-    # Copy SQL dump into container
+    
+    # Load SQL dump manually using pg_restore
+    print(f"Loading SQL dump into {container_name}...")
     subprocess.run(
         [
             "docker",
-            "cp",
-            SQL_DUMP_PATH,
-            f"{SHARED_PG_CONTAINER}:/tmp/metabase_envdata.sql",
+            "exec",
+            container_name,
+            "pg_restore",
+            "-U",
+            DB_USER,
+            "-d",
+            DB_NAME,
+            "--no-owner",
+            "--no-acl",
+            "/docker-entrypoint-initdb.d/dump.sql",
+        ],
+        capture_output=True,
+        check=False,  # May have warnings
+    )
+    print(f"SQL dump loaded into {container_name}")
+    
+    return container_name
+
+
+def _start_metabase_container(
+    short_id: str, network_name: str, postgres_container: str, metabase_port: int
+) -> str:
+    """
+    Start Metabase container connected to PostgreSQL.
+    Returns container name.
+    """
+    container_name = f"rollout-metabase-{short_id}"
+    
+    # Start Metabase container
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            "--network",
+            network_name,
+            "-e",
+            "MB_DB_TYPE=postgres",
+            "-e",
+            f"MB_DB_DBNAME={DB_NAME}",
+            "-e",
+            f"MB_DB_PORT=5432",
+            "-e",
+            f"MB_DB_USER={DB_USER}",
+            "-e",
+            f"MB_DB_PASS={DB_PASSWORD}",
+            "-e",
+            f"MB_DB_HOST={postgres_container}",
+            "-p",
+            f"{metabase_port}:3000",  # Expose for debugging
+            METABASE_IMAGE_NAME,
         ],
         check=True,
         capture_output=True,
     )
+    
+    # Wait for Metabase to be ready
+    print(f"Waiting for Metabase {container_name} to be ready...")
+    max_retries = 120  # 2 minutes
+    for i in range(max_retries):
+        try:
+            response = requests.get(
+                f"http://localhost:{metabase_port}/api/health",
+                timeout=2,
+            )
+            if response.status_code == 200:
+                print(f"Metabase {container_name} is ready")
+                return container_name
+        except Exception:
+            pass
+        
+        if i == max_retries - 1:
+            raise Exception(f"Metabase {container_name} failed to start in time")
+        time.sleep(1)
+    
+    return container_name
 
-    # Check if root_db already exists
-    result = subprocess.run(
+
+def _start_agent_container(
+    short_id: str,
+    network_name: str,
+    metabase_container: str,
+    rollout_id: str,
+    task_id: str,
+    task_text: str,
+    expected_answer: str,
+    agent_token: str,
+    gemini_api_key: str,
+    model_name: str,
+) -> str:
+    """
+    Start agent container connected to Metabase.
+    Returns container name.
+    """
+    container_name = f"rollout-agent-{short_id}"
+    metabase_url = f"http://{metabase_container}:3000"
+    
+    # Start agent container
+    # Add --add-host to ensure host.docker.internal works on custom networks
+    subprocess.run(
         [
             "docker",
-            "exec",
-            SHARED_PG_CONTAINER,
-            "psql",
-            "-U",
-            "metabase",
+            "run",
             "-d",
-            "postgres",
-            "-tAc",
-            "SELECT 1 FROM pg_database WHERE datname = 'root_db';",
+            "--name",
+            container_name,
+            "--network",
+            network_name,
+            "--add-host", "host.docker.internal:host-gateway",  # Ensure backend access works
+            "-e",
+            f"ROLLOUT_ID={rollout_id}",
+            "-e",
+            f"TASK_ID={task_id}",
+            "-e",
+            f"TASK_TEXT={task_text}",
+            "-e",
+            f"EXPECTED_ANSWER={expected_answer or ''}",
+            "-e",
+            f"BACKEND_URL={BACKEND_URL}",
+            "-e",
+            f"AGENT_TOKEN={agent_token}",
+            "-e",
+            f"GEMINI_API_KEY={gemini_api_key}",
+            "-e",
+            f"MODEL_NAME={model_name}",
+            "-e",
+            f"METABASE_URL={metabase_url}",
+            AGENT_IMAGE_NAME,
         ],
+        check=True,
         capture_output=True,
-        text=True,
     )
-
-    if result.stdout.strip() == "1":
-        print(f"root_db already exists, skipping restore")
-    else:
-        # Restore the dump (creates root_db database)
-        # Use --no-owner to avoid ownership conflicts (dump was created with different user)
-        print(f"Restoring SQL dump into root_db...")
-        result = subprocess.run(
-            [
-                "docker",
-                "exec",
-                SHARED_PG_CONTAINER,
-                "pg_restore",
-                "-U",
-                "metabase",
-                "-d",
-                "postgres",
-                "-C",
-                "--no-owner",
-                "--no-acl",
-                "/tmp/metabase_envdata.sql",
-            ],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            print(f"pg_restore stderr: {result.stderr}")
-            raise Exception(f"Failed to restore SQL dump: {result.stderr}")
-
-        print(f"SQL dump restored successfully")
-
-    print(f"Shared Postgres container ready with data loaded")
+    
+    print(f"Started agent container {container_name}")
+    return container_name
 
 
-def provision_environment(rollout_id: str) -> Tuple[int, str, str]:
+def provision_environment(
+    rollout_id: str,
+    task_id: str,
+    task_text: str,
+    expected_answer: str,
+    agent_token: str,
+    model_name: str = "gemini-2.5-computer-use-preview-10-2025",
+) -> Tuple[int, str]:
     """
-    Provision a Metabase environment for a rollout.
-    Each rollout gets its own isolated database within the shared Postgres container.
+    Provision a multi-container environment with separate PostgreSQL, Metabase, and Agent containers.
+    Each rollout gets its own Docker network and 3 containers.
 
     Returns:
-        Tuple of (metabase_port, postgres_container_name, metabase_container_name)
+        Tuple of (metabase_port, agent_container_name)
     """
+    # Ensure the Docker image is built
+    if not build_agent_image():
+        raise Exception("Failed to build agent Docker image")
+    
     short_id = rollout_id[:8]
-    mb_container = f"rollout-mb-{short_id}"
-    db_name = f"rollout_db_{short_id}"  # Unique database name for this rollout
-
-    # Allocate port for Metabase
+    network_name = f"rollout-net-{short_id}"
+    
+    # Allocate port for Metabase (for debugging/access)
     metabase_port = allocate_port()
+    
+    postgres_container = None
+    metabase_container = None
+    agent_container = None
 
     try:
-        # Ensure shared Postgres is running
-        ensure_shared_postgres()
-
-        # Create a new database for this rollout within the shared Postgres
-        print(f"Creating isolated database {db_name} for rollout {short_id}...")
-
-        # Copy SQL dump into container (if not already there)
-        if os.path.exists(SQL_DUMP_PATH):
-            subprocess.run(
-                [
-                    "docker",
-                    "cp",
-                    SQL_DUMP_PATH,
-                    f"{SHARED_PG_CONTAINER}:/tmp/metabase_envdata.sql",
-                ],
-                check=True,
-                capture_output=True,
-            )
-
-        # Create a new database and restore the dump into it
-        # First create the database
+        # Get Gemini API key from environment
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        if not gemini_api_key:
+            raise Exception("GEMINI_API_KEY environment variable not set")
+        
+        # 1. Create Docker network
+        print(f"Creating Docker network {network_name}...")
         subprocess.run(
-            [
-                "docker",
-                "exec",
-                SHARED_PG_CONTAINER,
-                "psql",
-                "-U",
-                "metabase",
-                "-d",
-                "postgres",
-                "-c",
-                f"CREATE DATABASE {db_name};",
-            ],
+            ["docker", "network", "create", network_name],
             check=True,
             capture_output=True,
         )
-
-        # Restore the dump into the new database
-        # Note: The dump contains "CREATE DATABASE root_db", so we need to handle this
-        # We'll restore it and it will create root_db, then we can rename or use root_db directly
-        subprocess.run(
-            [
-                "docker",
-                "exec",
-                SHARED_PG_CONTAINER,
-                "pg_restore",
-                "-U",
-                "metabase",
-                "-d",
-                "postgres",
-                "--clean",
-                "--if-exists",
-                "-C",
-                "/tmp/metabase_envdata.sql",
-            ],
-            check=False,  # Don't fail if database already exists
-            capture_output=True,
+        print(f"Created network {network_name}")
+        
+        # 2. Start PostgreSQL container with SQL dump
+        postgres_container = _start_postgres_container(
+            short_id, network_name, SQL_DUMP_PATH
         )
-
-        # Now root_db exists with the data. We need to clone it to our rollout-specific database
-        # Drop the rollout db we just created and recreate it as a template from root_db
-        subprocess.run(
-            [
-                "docker",
-                "exec",
-                SHARED_PG_CONTAINER,
-                "psql",
-                "-U",
-                "metabase",
-                "-d",
-                "postgres",
-                "-c",
-                f"DROP DATABASE IF EXISTS {db_name};",
-            ],
-            check=True,
-            capture_output=True,
+        
+        # 3. Start Metabase container
+        metabase_container = _start_metabase_container(
+            short_id, network_name, postgres_container, metabase_port
         )
-
-        subprocess.run(
-            [
-                "docker",
-                "exec",
-                SHARED_PG_CONTAINER,
-                "psql",
-                "-U",
-                "metabase",
-                "-d",
-                "postgres",
-                "-c",
-                f"CREATE DATABASE {db_name} WITH TEMPLATE root_db;",
-            ],
-            check=True,
-            capture_output=True,
+        
+        # 4. Start Agent container
+        agent_container = _start_agent_container(
+            short_id,
+            network_name,
+            metabase_container,
+            rollout_id,
+            task_id,
+            task_text,
+            expected_answer,
+            agent_token,
+            gemini_api_key,
+            model_name,
         )
-
-        print(f"Database {db_name} created with isolated copy of data")
-
-        # Start Metabase container connected to this specific database
-        print(f"Starting Metabase container {mb_container}...")
-        subprocess.run(
-            [
-                "docker",
-                "run",
-                "-d",
-                "--name",
-                mb_container,
-                "--network",
-                "rollout-net",
-                "-e",
-                "MB_DB_TYPE=postgres",
-                "-e",
-                f"MB_DB_DBNAME={db_name}",
-                "-e",
-                "MB_DB_PORT=5432",
-                "-e",
-                "MB_DB_USER=metabase",
-                "-e",
-                "MB_DB_PASS=metabase_password",
-                "-e",
-                f"MB_DB_HOST={SHARED_PG_CONTAINER}",
-                "-p",
-                f"{metabase_port}:3000",
-                "metabase/metabase",
-            ],
-            check=True,
-            capture_output=True,
-        )
-
-        # Wait for Metabase to be ready (health check)
-        print(f"Waiting for Metabase to be ready on port {metabase_port}...")
-        max_retries = 120  # Metabase can take up to 2 minutes
-        for i in range(max_retries):
-            try:
-                response = requests.get(
-                    f"http://localhost:{metabase_port}/api/health", timeout=5
-                )
-                if response.status_code == 200:
-                    print(f"Metabase is ready!")
-                    break
-            except:
-                pass
-            if i % 10 == 0:
-                try:
-                    print(
-                        f"Still waiting for Metabase... ({i}/{max_retries})",
-                        file=sys.__stdout__,
-                    )
-                except (ValueError, OSError):
-                    # stdout might be closed, use __stdout__ directly
-                    sys.__stdout__.write(
-                        f"Still waiting for Metabase... ({i}/{max_retries})\n"
-                    )
-                    sys.__stdout__.flush()
-            time.sleep(1)
-        else:
-            raise Exception("Metabase failed to start in time")
-
-        # Return shared Postgres container name for tracking
-        return metabase_port, SHARED_PG_CONTAINER, mb_container
+        
+        print(f"Environment provisioned successfully for rollout {short_id}")
+        print(f"  - Network: {network_name}")
+        print(f"  - PostgreSQL: {postgres_container}")
+        print(f"  - Metabase: {metabase_container} (port {metabase_port})")
+        print(f"  - Agent: {agent_container}")
+        
+        return metabase_port, agent_container
 
     except Exception as e:
+        print(f"Error provisioning environment: {e}")
         # Cleanup on failure
-        try:
-            print(f"Error provisioning environment: {e}", file=sys.__stderr__)
-        except (ValueError, OSError):
-            # stderr might be closed, use __stderr__ directly
-            sys.__stderr__.write(f"Error provisioning environment: {e}\n")
-            sys.__stderr__.flush()
-        teardown_environment(rollout_id, None, mb_container, metabase_port)
+        teardown_environment(rollout_id, agent_container, metabase_port)
         raise
 
 
 def teardown_environment(
     rollout_id: str,
-    pg_container: str = None,
-    mb_container: str = None,
+    container_name: str = None,
     port: int = None,
 ):
     """
-    Teardown a Metabase environment.
-    Removes the Metabase container and drops the rollout-specific database.
-    The shared Postgres container stays running for other rollouts.
+    Teardown a multi-container environment.
+    Removes all containers (agent, metabase, postgres) and the network.
     """
     short_id = rollout_id[:8]
-    if not mb_container:
-        mb_container = f"rollout-mb-{short_id}"
-    db_name = f"rollout_db_{short_id}"
-
-    # Stop and remove the Metabase container
-    try:
-        subprocess.run(
-            ["docker", "stop", mb_container],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        subprocess.run(["docker", "rm", mb_container], capture_output=True, check=False)
+    network_name = f"rollout-net-{short_id}"
+    
+    containers = [
+        f"rollout-agent-{short_id}",
+        f"rollout-metabase-{short_id}",
+        f"rollout-postgres-{short_id}",
+    ]
+    
+    # Stop and remove all containers
+    for container in containers:
         try:
-            print(f"Removed container {mb_container}", file=sys.__stdout__)
-        except (ValueError, OSError):
-            sys.__stdout__.write(f"Removed container {mb_container}\n")
-            sys.__stdout__.flush()
-    except Exception as e:
-        try:
-            print(f"Error removing container {mb_container}: {e}", file=sys.__stderr__)
-        except (ValueError, OSError):
-            sys.__stderr__.write(f"Error removing container {mb_container}: {e}\n")
-            sys.__stderr__.flush()
-
-    # Drop the rollout-specific database to free up space
-    try:
-        # Check if shared Postgres container is running
-        result = subprocess.run(
-            ["docker", "ps", "-q", "-f", f"name={SHARED_PG_CONTAINER}"],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.stdout.strip():
             subprocess.run(
-                [
-                    "docker",
-                    "exec",
-                    SHARED_PG_CONTAINER,
-                    "psql",
-                    "-U",
-                    "metabase",
-                    "-d",
-                    "postgres",
-                    "-c",
-                    f"DROP DATABASE IF EXISTS {db_name};",
-                ],
+                ["docker", "stop", container],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            subprocess.run(
+                ["docker", "rm", container],
                 capture_output=True,
                 check=False,
             )
-            try:
-                print(f"Dropped database {db_name}", file=sys.__stdout__)
-            except (ValueError, OSError):
-                sys.__stdout__.write(f"Dropped database {db_name}\n")
-                sys.__stdout__.flush()
-    except Exception as e:
-        try:
-            print(f"Error dropping database {db_name}: {e}", file=sys.__stderr__)
-        except (ValueError, OSError):
-            sys.__stderr__.write(f"Error dropping database {db_name}: {e}\n")
-            sys.__stderr__.flush()
+            print(f"Removed container {container}")
+        except Exception:
+            pass
+    
+    # Remove network
+    try:
+        subprocess.run(
+            ["docker", "network", "rm", network_name],
+            capture_output=True,
+            check=False,
+        )
+        print(f"Removed network {network_name}")
+    except Exception:
+        pass
 
     # Release port
     if port:
         release_port(port)
 
 
-def cleanup_all():
+def is_container_running(container_name: str) -> bool:
     """
-    Cleanup all rollout Metabase containers and their databases (called on shutdown).
-    Note: The shared Postgres container is preserved for future use.
-    Use cleanup_shared_postgres() to remove it if needed.
+    Check if a container is currently running.
+    
+    Returns:
+        True if container exists and is running, False otherwise
     """
     try:
-        # List all Metabase containers with the rollout prefix
         result = subprocess.run(
             [
                 "docker",
-                "ps",
-                "-a",
+                "inspect",
+                "-f",
+                "{{.State.Running}}",
+                container_name,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        
+        # If container doesn't exist, inspect returns non-zero exit code
+        if result.returncode != 0:
+            return False
+        
+        # Check if the container is running
+        return result.stdout.strip().lower() == "true"
+        
+    except Exception:
+        return False
+
+
+def cleanup_all():
+    """
+    Cleanup all rollout containers and networks (called on shutdown).
+    """
+    try:
+        # Cleanup all containers with rollout prefix
+        for prefix in ["rollout-agent-", "rollout-metabase-", "rollout-postgres-"]:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    f"name={prefix}",
+                    "--format",
+                    "{{.Names}}",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            containers = result.stdout.strip().split("\n")
+            containers = [c for c in containers if c]  # Filter empty strings
+
+            for container in containers:
+                try:
+                    subprocess.run(
+                        ["docker", "stop", container],
+                        capture_output=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    subprocess.run(
+                        ["docker", "rm", container],
+                        capture_output=True,
+                        check=False,
+                    )
+                    print(f"Cleaned up container {container}")
+                except Exception:
+                    pass
+        
+        # Cleanup all networks with rollout prefix
+        result = subprocess.run(
+            [
+                "docker",
+                "network",
+                "ls",
                 "--filter",
-                "name=rollout-mb-",
+                "name=rollout-net-",
                 "--format",
-                "{{.Names}}",
+                "{{.Name}}",
             ],
             capture_output=True,
             text=True,
             check=True,
         )
-
-        containers = result.stdout.strip().split("\n")
-        containers = [c for c in containers if c]  # Filter empty strings
-
-        for container in containers:
+        
+        networks = result.stdout.strip().split("\n")
+        networks = [n for n in networks if n]
+        
+        for network in networks:
             try:
-                # Extract rollout ID from container name (rollout-mb-<short_id>)
-                if container.startswith("rollout-mb-"):
-                    short_id = container.replace("rollout-mb-", "")
-                    db_name = f"rollout_db_{short_id}"
-
-                    # Drop the database
-                    subprocess.run(
-                        [
-                            "docker",
-                            "exec",
-                            SHARED_PG_CONTAINER,
-                            "psql",
-                            "-U",
-                            "metabase",
-                            "-d",
-                            "postgres",
-                            "-c",
-                            f"DROP DATABASE IF EXISTS {db_name};",
-                        ],
-                        capture_output=True,
-                        check=False,
-                    )
-                    print(f"Dropped database {db_name}")
-
-                # Stop and remove container
                 subprocess.run(
-                    ["docker", "stop", container],
+                    ["docker", "network", "rm", network],
                     capture_output=True,
-                    timeout=30,
                     check=False,
                 )
-                subprocess.run(
-                    ["docker", "rm", container], capture_output=True, check=False
-                )
-                print(f"Cleaned up container {container}")
-            except Exception as e:
-                print(f"Error cleaning up container {container}: {e}")
+                print(f"Cleaned up network {network}")
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"Error during cleanup: {e}")
-
-
-def cleanup_shared_postgres():
-    """
-    Stop and remove the shared Postgres container.
-    This will delete all Metabase application data and rollout databases!
-    Only call this when you want to completely reset the system.
-    """
-    try:
-        # First drop all rollout databases
-        result = subprocess.run(
-            [
-                "docker",
-                "exec",
-                SHARED_PG_CONTAINER,
-                "psql",
-                "-U",
-                "metabase",
-                "-d",
-                "postgres",
-                "-t",
-                "-c",
-                "SELECT datname FROM pg_database WHERE datname LIKE 'rollout_db_%';",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        if result.returncode == 0:
-            databases = [
-                db.strip() for db in result.stdout.strip().split("\n") if db.strip()
-            ]
-            for db_name in databases:
-                subprocess.run(
-                    [
-                        "docker",
-                        "exec",
-                        SHARED_PG_CONTAINER,
-                        "psql",
-                        "-U",
-                        "metabase",
-                        "-d",
-                        "postgres",
-                        "-c",
-                        f"DROP DATABASE IF EXISTS {db_name};",
-                    ],
-                    capture_output=True,
-                    check=False,
-                )
-                print(f"Dropped database {db_name}")
-
-        # Now stop and remove the container
-        print(
-            f"Stopping and removing shared Postgres container {SHARED_PG_CONTAINER}..."
-        )
-        subprocess.run(
-            ["docker", "stop", SHARED_PG_CONTAINER],
-            capture_output=True,
-            timeout=30,
-            check=False,
-        )
-        subprocess.run(
-            ["docker", "rm", SHARED_PG_CONTAINER],
-            capture_output=True,
-            check=False,
-        )
-        print(f"Shared Postgres container removed")
-    except Exception as e:
-        print(f"Error removing shared Postgres: {e}")
