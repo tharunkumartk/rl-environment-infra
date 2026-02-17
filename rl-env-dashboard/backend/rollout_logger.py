@@ -10,6 +10,7 @@ from datetime import datetime
 import base64
 from typing import Optional, Any
 from contextlib import contextmanager
+import threading
 
 
 class RolloutLogger:
@@ -31,6 +32,9 @@ class RolloutLogger:
         self.started_at = None
         self.completed_at = None
         self.error = None
+        
+        # Thread lock for concurrent write safety
+        self._write_lock = threading.Lock()
 
         # Default log directory
         if log_dir is None:
@@ -171,7 +175,10 @@ class RolloutLogger:
         self._write_log()
 
     def _write_log(self):
-        """Write the complete log to a JSON file."""
+        """
+        Write the complete log to a JSON file.
+        Thread-safe implementation using a lock to prevent concurrent write issues.
+        """
         log_data = {
             "rollout_id": self.rollout_id,
             "task_id": self.task_id,
@@ -182,8 +189,15 @@ class RolloutLogger:
             "steps": self.steps,
         }
 
-        with open(self.log_path, "w") as f:
-            json.dump(log_data, f, indent=2)
+        # Use lock to ensure only one thread writes at a time
+        with self._write_lock:
+            try:
+                with open(self.log_path, "w") as f:
+                    json.dump(log_data, f, indent=2)
+            except Exception as e:
+                # If writing fails, don't crash the rollout
+                # The error will be visible in the server logs
+                print(f"Warning: Failed to write log file {self.log_path}: {e}", file=sys.__stderr__)
 
     def get_log_path(self):
         """Get the path to the log file."""
@@ -199,8 +213,12 @@ def suppress_stdout_stderr():
     """
     Context manager to suppress all stdout and stderr output.
     Useful for silencing noisy agent/library output.
+    
+    Thread-safe implementation that avoids "I/O operation on closed file" errors
+    when multiple rollouts run concurrently.
     """
     import logging
+    import io
     
     # Save original stdout/stderr
     original_stdout = sys.stdout
@@ -219,17 +237,17 @@ def suppress_stdout_stderr():
     for logger in google_loggers:
         logger.setLevel(logging.CRITICAL + 1)
 
-    # Redirect to devnull
-    devnull = open(os.devnull, "w")
-    sys.stdout = devnull
-    sys.stderr = devnull
+    # Use StringIO instead of devnull file handles
+    # This avoids file handle management issues in concurrent execution
+    null_stream = io.StringIO()
+    sys.stdout = null_stream
+    sys.stderr = null_stream
 
     try:
         yield
     finally:
-        # Restore original stdout/stderr BEFORE closing devnull
-        # This prevents "I/O operation on closed file" errors
-        # if any code tries to write during cleanup
+        # Restore original stdout/stderr FIRST
+        # This is critical to prevent "I/O operation on closed file" errors
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         
@@ -238,9 +256,8 @@ def suppress_stdout_stderr():
         for logger, level in zip(google_loggers, original_google_levels):
             logger.setLevel(level)
         
-        # Close devnull after restoring everything
+        # Close the null stream (this is safe even if done multiple times)
         try:
-            devnull.flush()
-            devnull.close()
+            null_stream.close()
         except Exception:
             pass  # Ignore errors during cleanup

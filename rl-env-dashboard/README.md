@@ -85,18 +85,18 @@ The frontend will be available at `http://localhost:3000`
 
 4. **Spawn rollouts**: Select a task and click "+ New Rollout"
    - The system will:
-     - Provision a Postgres container and load the SQL data
-     - Start a Metabase instance on a unique port
+     - Provision a dedicated Postgres container for this rollout and load the SQL data
+     - Start a Metabase instance on a unique port connected to this Postgres container
      - Wait for Metabase to be healthy
      - Run the browser agent to complete the task
      - Record a video of the execution
      - Verify the output against the expected answer
-     - Tear down the containers
+     - Tear down both containers (Postgres and Metabase)
 
 5. **Monitor progress**: Rollout cards update every 3 seconds showing:
-   - Status: pending → provisioning → running → completed/failed
+   - Status: pending → provisioning → running → success/failed/error
    - Parsed JSON results
-   - Success/failure indicators
+   - Status indicators
    - Video recordings
    - Error messages (if any)
 
@@ -134,20 +134,24 @@ The frontend will be available at `http://localhost:3000`
 ### Rollout Lifecycle
 
 ```
-pending → provisioning → running → completed/failed
+pending → provisioning → running → success/failed/error
 ```
 
 1. **Pending**: Rollout created in DB, waiting for worker thread
 2. **Provisioning**: Docker containers starting, SQL data loading, Metabase health check
 3. **Running**: Agent executing the task via Playwright
-4. **Completed/Failed**: Task finished, containers torn down, results stored
+4. **Success/Failed/Error**: Task finished, containers torn down, results stored
+   - **Success**: Task completed and verification passed
+   - **Failed**: Task completed but verification failed
+   - **Error**: Exception occurred during provisioning or execution
 
 ### Resource Management
 
-- **Port allocation**: Metabase instances use ports 3001+, automatically tracked
-- **Container naming**: `rollout-pg-{id}` and `rollout-mb-{id}`
+- **Port allocation**: Metabase instances use ports 8100+, automatically tracked and released
+- **Container naming**: `rollout-pg-{id}` (Postgres) and `rollout-mb-{id}` (Metabase)
+- **Database isolation**: Each rollout gets its own dedicated Postgres container with a fresh copy of the data
 - **Video storage**: `computer-use-preview/task_recordings/{task_id}/rollout_{id}/`
-- **Cleanup**: Automatic teardown on completion or shutdown
+- **Cleanup**: Automatic teardown of both Postgres and Metabase containers on completion or shutdown
 
 ## Configuration
 

@@ -3,11 +3,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import os
+import logging
+import sys
 
 import database
 import docker_manager
 import worker
 from routes import router
+
+# Configure logging for the entire application
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ],
+    force=True  # Override any existing configuration
+)
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 # Paths to computer-use outputs (relative to this file)
 COMPUTER_USE_PATH = os.path.join(
@@ -20,18 +35,18 @@ LOG_PATH = os.path.join(COMPUTER_USE_PATH, "task_logs")
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     # Startup
-    print("Initializing database...")
+    logger.info("Initializing database...")
     await database.init_db()
-    print("Database initialized")
+    logger.info("Database initialized")
 
     yield
 
     # Shutdown
-    print("Cleaning up Docker containers...")
+    logger.info("Cleaning up Docker containers...")
     docker_manager.cleanup_all()
-    print("Shutting down worker pool...")
+    logger.info("Shutting down worker pool...")
     worker.shutdown()
-    print("Shutdown complete")
+    logger.info("Shutdown complete")
 
 
 app = FastAPI(title="RL Environment Dashboard API", lifespan=lifespan)
