@@ -66,6 +66,7 @@ the benchmark consists of 10 sql-style data retrieval problems over a synthetic 
 cd rl-env-dashboard/backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r ../computer-use-preview/requirements.txt
 export GEMINI_API_KEY="your-key"
 uvicorn main:app --reload
 
